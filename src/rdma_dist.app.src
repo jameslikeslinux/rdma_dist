@@ -1,0 +1,12 @@
+{application, rdma_dist,
+ [
+  {description, ""},
+  {vsn, "1"},
+  {registered, []},
+  {applications, [
+                  kernel,
+                  stdlib
+                 ]},
+  {mod, { rdma_dist_app, []}},
+  {env, []}
+ ]}.
