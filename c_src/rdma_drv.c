@@ -1,3 +1,4 @@
+#include <sys/time.h>
 #include <stdbool.h>
 #include <string.h>
 #include <erl_driver.h>
@@ -9,6 +10,7 @@
 #define DRV_LISTEN        'L'
 #define DRV_PORT          'P'
 #define DRV_POLL          'p'
+#define DRV_TIME          'T'
 
 #define BUFFER_SIZE   1024
 #define TIMEOUT_IN_MS 500
@@ -24,7 +26,20 @@ typedef struct {
     struct ibv_cq *cq;
     struct ibv_mr *send_mr, *recv_mr;
     char *send_region, *recv_region;
+
+    struct timeval time_start;
+    int op_time;
 } RdmaDrvData;
+
+static inline void start_timer(RdmaDrvData *data) {
+    gettimeofday(&data->time_start, NULL);
+}
+
+static inline void stop_timer(RdmaDrvData *data) {
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    data->op_time = now.tv_usec - data->time_start.tv_usec;
+}
 
 static void post_ready(RdmaDrvData *data) {
     printf("Sending READY\n");
@@ -137,8 +152,12 @@ static void rdma_drv_stop(ErlDrvData drv_data) {
 static void rdma_drv_output(ErlDrvData drv_data, char *buf, ErlDrvSizeT len) {
     RdmaDrvData *data = (RdmaDrvData *) drv_data;
 
+    start_timer(data);
+
     memcpy(data->send_region, buf, len < BUFFER_SIZE ? len : BUFFER_SIZE);
     post_send(data);
+
+    stop_timer(data);
 }
 
 static void rdma_drv_handle_rdma_cm_event_connect_request(RdmaDrvData *data, struct rdma_cm_event *cm_event) {
@@ -330,6 +349,12 @@ static void rdma_drv_control_poll(RdmaDrvData *data, ei_x_buff *x) {
     ei_x_encode_atom(x, "ok");
 }
 
+static void rdma_drv_control_time(RdmaDrvData *data, ei_x_buff *x) {
+    ei_x_encode_tuple_header(x, 2);
+    ei_x_encode_atom(x, "ok");
+    ei_x_encode_ulong(x, data->op_time);
+}
+
 static ErlDrvSSizeT rdma_drv_control(ErlDrvData drv_data, unsigned int command, char *buf, ErlDrvSizeT len, char **rbuf, ErlDrvSizeT rlen) {
     RdmaDrvData *data = (RdmaDrvData *) drv_data;
 
@@ -351,6 +376,10 @@ static ErlDrvSSizeT rdma_drv_control(ErlDrvData drv_data, unsigned int command, 
 
         case DRV_POLL:
             rdma_drv_control_poll(data, &x);
+            break;
+
+        case DRV_TIME:
+            rdma_drv_control_time(data, &x);
             break;
 
         default:

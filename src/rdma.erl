@@ -2,7 +2,7 @@
 -author("James Lee <jlee@thestaticvoid.com>").
 -behavior(gen_fsm).
 
--export([connect/2, listen/1, accept/1, port/1, send/2, recv/1, close/1]).
+-export([connect/2, listen/1, accept/1, port/1, send/2, recv/1, close/1, time/1]).
 -export([init/1, disconnected/3, connecting/3, connected/3, closed/3, waiting/3, listening/3, handle_sync_event/4, handle_info/3]).
 
 -record(state_data, {port, queue, caller}).
@@ -11,6 +11,7 @@
 -define(DRV_LISTEN, $L).
 -define(DRV_PORT, $P).
 -define(DRV_POLL, $p).
+-define(DRV_TIME, $T).
 
 
 %%
@@ -44,6 +45,9 @@ recv(Socket) ->
 
 close(Socket) ->
     gen_fsm:sync_send_all_state_event(Socket, close).
+
+time(Socket) ->
+    gen_fsm:sync_send_all_state_event(Socket, time).
 
 %%
 %% Callbacks
@@ -120,7 +124,10 @@ waiting({accept, Port}, _From, StateData) ->
 
 handle_sync_event(close, _From, _State, StateData) ->
     port_close(StateData#state_data.port),
-    {reply, ok, closed, StateData}.   
+    {reply, ok, closed, StateData};
+
+handle_sync_event(time, _From, State, StateData) ->
+    {reply, port_sync_control(StateData#state_data.port, ?DRV_TIME, []), State, StateData}.   
 
 handle_info({event, Event}, State, StateData = #state_data{caller = Caller}) ->
     case ?MODULE:State(Event, Caller, StateData) of
