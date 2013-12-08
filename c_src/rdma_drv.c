@@ -6,6 +6,7 @@
 #include <rdma/rdma_cma.h>
 #include <fcntl.h>
 
+#define DRV_ACCEPT        'A'
 #define DRV_CONNECT       'C'
 #define DRV_LISTEN        'L'
 #define DRV_PORT          'P'
@@ -15,7 +16,9 @@
 #define BUFFER_SIZE   1024
 #define TIMEOUT_IN_MS 500
 
-typedef struct {
+#define NONBLOCK
+
+typedef struct rdma_drv_data {
     ErlDrvPort port;
 
     struct rdma_cm_id *id;
@@ -29,7 +32,89 @@ typedef struct {
 
     struct timeval time_start;
     int op_time;
+
+    struct rdma_drv_data *new_data;
+
+#ifndef NONBLOCK
+    ErlDrvTid comp_channel_thread;
+    ErlDrvTid event_channel_thread;
+#endif
 } RdmaDrvData;
+
+#ifndef NONBLOCK
+static void rdma_drv_handle_rdma_cm_event(RdmaDrvData *data, struct rdma_cm_event *cm_event);
+static void rdma_drv_handle_comp_channel_event(RdmaDrvData *data, struct ibv_cq *cq);
+
+static void * poll_comp_channel(void *thread_data) {
+    RdmaDrvData *data = (RdmaDrvData *) thread_data;
+
+    void *ev_ctx;
+    struct ibv_cq *cq;
+    while (ibv_get_cq_event(data->comp_channel, &cq, &ev_ctx) == 0) {
+        printf("Got comp event\n");
+        ibv_ack_cq_events(cq, 1);
+        ibv_req_notify_cq(cq, 0);
+        rdma_drv_handle_comp_channel_event(data, cq);
+    }
+
+    return NULL;
+} 
+
+static void * poll_event_channel(void *thread_data) {
+    RdmaDrvData *data = (RdmaDrvData *) thread_data;
+    
+    struct rdma_cm_event *cm_event;
+    while (rdma_get_cm_event(data->ec, &cm_event) == 0) {
+        printf("Got cm event\n");
+        rdma_drv_handle_rdma_cm_event(data, cm_event);
+        rdma_ack_cm_event(cm_event);
+    }
+
+    return NULL;
+} 
+#endif
+
+static void start_poll(RdmaDrvData *data) {
+    if (data->comp_channel) {
+#ifdef NONBLOCK
+        fcntl(data->comp_channel->fd, F_SETFL, fcntl(data->comp_channel->fd, F_GETFL) | O_NONBLOCK);
+        driver_select(data->port, (ErlDrvEvent) data->comp_channel->fd, ERL_DRV_READ, 1);
+#else
+        if (!data->comp_channel_thread) {
+            printf("Starting comp_channel_thread\n");
+            erl_drv_thread_create("comp_channel_thread", &data->comp_channel_thread, poll_comp_channel, data, NULL);
+        }
+#endif
+    }
+
+    if (data->ec) {
+#ifdef NONBLOCK
+        fcntl(data->ec->fd, F_SETFL, fcntl(data->ec->fd, F_GETFL) | O_NONBLOCK);
+        driver_select(data->port, (ErlDrvEvent) data->ec->fd, ERL_DRV_READ, 1);
+#else
+        if (!data->event_channel_thread) {
+            printf("Starting event_channel_thread\n");
+            erl_drv_thread_create("event_channel_thread", &data->event_channel_thread, poll_event_channel, data, NULL);
+        }
+#endif
+    }
+}
+
+static void stop_poll(RdmaDrvData *data) {
+    if (data->comp_channel) {
+#ifdef NONBLOCK
+        driver_select(data->port, (ErlDrvEvent) data->comp_channel->fd, ERL_DRV_READ, 0);
+#else
+#endif
+    }
+
+    if (data->ec) {
+#ifdef NONBLOCK
+        driver_select(data->port, (ErlDrvEvent) data->ec->fd, ERL_DRV_READ, 0);
+#else
+#endif
+    }
+}
 
 static inline void start_timer(RdmaDrvData *data) {
     gettimeofday(&data->time_start, NULL);
@@ -86,7 +171,6 @@ static void init_ibverbs(RdmaDrvData *data) {
     data->pd = ibv_alloc_pd(data->id->verbs);
 
     data->comp_channel = ibv_create_comp_channel(data->id->verbs);
-    fcntl(data->comp_channel->fd, F_SETFL, fcntl(data->comp_channel->fd, F_GETFL) | O_NONBLOCK);
 
     data->cq = ibv_create_cq(data->id->verbs, 10, NULL, data->comp_channel, 0);
     ibv_req_notify_cq(data->cq, 0);
@@ -133,16 +217,13 @@ static ErlDrvData rdma_drv_start(ErlDrvPort port, char *command) {
 static void rdma_drv_stop(ErlDrvData drv_data) {
     RdmaDrvData *data = (RdmaDrvData *) drv_data;
 
-    if (data->comp_channel) {
-        driver_select(data->port, (ErlDrvEvent) data->comp_channel->fd, ERL_DRV_READ, 0);
-    }
+    stop_poll(data);
 
     if (data->id) {
         rdma_destroy_id(data->id);
     }
 
     if (data->ec) {
-        driver_select(data->port, (ErlDrvEvent) data->ec->fd, ERL_DRV_READ, 0);
         rdma_destroy_event_channel(data->ec);
     }
 
@@ -184,7 +265,7 @@ static void rdma_drv_handle_rdma_cm_event_addr_resolved(RdmaDrvData *data, struc
 
 static void rdma_drv_handle_rdma_cm_event_route_resolved(RdmaDrvData *data, struct rdma_cm_event *cm_event) {
     init_ibverbs(data);
-    driver_select(data->port, (ErlDrvEvent) data->comp_channel->fd, ERL_DRV_READ, 1);
+    start_poll(data);
 
     struct rdma_conn_param cm_params = {};
     rdma_connect(data->id, &cm_params);
@@ -193,16 +274,7 @@ static void rdma_drv_handle_rdma_cm_event_route_resolved(RdmaDrvData *data, stru
 static void rdma_drv_handle_rdma_cm_event_established(RdmaDrvData *data, struct rdma_cm_event *cm_event) {
     if (cm_event->id->context) {
         RdmaDrvData *new_data = (RdmaDrvData *) cm_event->id->context;
-
-        ErlDrvTermData spec[] = {
-            ERL_DRV_ATOM, driver_mk_atom("event"),
-                ERL_DRV_ATOM, driver_mk_atom("accept"),
-                ERL_DRV_PORT, driver_mk_port(new_data->port),
-                ERL_DRV_TUPLE, 2,
-            ERL_DRV_TUPLE, 2,
-        };
-
-        erl_drv_output_term(driver_mk_port(data->port), spec, sizeof(spec) / sizeof(spec[0]));
+        data->new_data = new_data;
     } else {
         ErlDrvTermData spec[] = {
             ERL_DRV_ATOM, driver_mk_atom("event"),
@@ -214,10 +286,7 @@ static void rdma_drv_handle_rdma_cm_event_established(RdmaDrvData *data, struct 
     }
 }
 
-static void rdma_drv_handle_rdma_cm_event(RdmaDrvData *data) {
-    struct rdma_cm_event *cm_event;
-    rdma_get_cm_event(data->ec, &cm_event);
-
+static void rdma_drv_handle_rdma_cm_event(RdmaDrvData *data, struct rdma_cm_event *cm_event) {
     switch (cm_event->event) {
         case RDMA_CM_EVENT_CONNECT_REQUEST:
             rdma_drv_handle_rdma_cm_event_connect_request(data, cm_event);
@@ -239,18 +308,10 @@ static void rdma_drv_handle_rdma_cm_event(RdmaDrvData *data) {
             /* XXX: Do something */
             break;
     }
-
-    rdma_ack_cm_event(cm_event);
 }
 
-static void rdma_drv_handle_comp_channel_event(RdmaDrvData *data) {
-    void *ev_ctx;
-    struct ibv_cq *cq;
+static void rdma_drv_handle_comp_channel_event(RdmaDrvData *data, struct ibv_cq *cq) {
     struct ibv_wc wc;
-
-    ibv_get_cq_event(data->comp_channel, &cq, &ev_ctx);
-    ibv_ack_cq_events(cq, 1);
-    ibv_req_notify_cq(cq, 0);
 
     while (ibv_poll_cq(cq, 1, &wc)) {
         // XXX: check wc.status
@@ -283,9 +344,18 @@ static void rdma_drv_ready_input(ErlDrvData drv_data, ErlDrvEvent event) {
     RdmaDrvData *data = (RdmaDrvData *) drv_data;
 
     if (data->ec && event == (ErlDrvEvent) data->ec->fd) {
-        rdma_drv_handle_rdma_cm_event(data);
+        struct rdma_cm_event *cm_event;
+        rdma_get_cm_event(data->ec, &cm_event);
+        rdma_drv_handle_rdma_cm_event(data, cm_event);
+        rdma_ack_cm_event(cm_event);
     } else if (data->comp_channel && event == (ErlDrvEvent) data->comp_channel->fd) {
-        rdma_drv_handle_comp_channel_event(data);
+        void *ev_ctx;
+        struct ibv_cq *cq;
+        ibv_get_cq_event(data->comp_channel, &cq, &ev_ctx);
+        ibv_ack_cq_events(cq, 1);
+        ibv_req_notify_cq(cq, 0);
+
+        rdma_drv_handle_comp_channel_event(data, cq);
     }
 }
 
@@ -301,8 +371,7 @@ static void rdma_drv_control_connect(RdmaDrvData *data, char *buf, ei_x_buff *x)
     getaddrinfo(host, port_number, hints, &addr);
 
     data->ec = rdma_create_event_channel();
-    fcntl(data->ec->fd, F_SETFL, fcntl(data->ec->fd, F_GETFL) | O_NONBLOCK);
-    driver_select(data->port, (ErlDrvEvent) data->ec->fd, ERL_DRV_READ, 1);
+    start_poll(data);
 
     void *context = NULL;
     rdma_create_id(data->ec, &data->id, context, RDMA_PS_TCP);
@@ -320,8 +389,7 @@ static void rdma_drv_control_listen(RdmaDrvData *data, ei_x_buff *x) {
     data->ec = rdma_create_event_channel();
 
     // Make event channel non-blocking and poll the channel
-    fcntl(data->ec->fd, F_SETFL, fcntl(data->ec->fd, F_GETFL) | O_NONBLOCK);
-    driver_select(data->port, (ErlDrvEvent) data->ec->fd, ERL_DRV_READ, 1);
+    start_poll(data);
 
     // XXX: Test
     void *context = NULL;
@@ -345,7 +413,7 @@ static void rdma_drv_control_port(RdmaDrvData *data, ei_x_buff *x) {
 }
 
 static void rdma_drv_control_poll(RdmaDrvData *data, ei_x_buff *x) {
-    driver_select(data->port, (ErlDrvEvent) data->comp_channel->fd, ERL_DRV_READ, 1);
+    start_poll(data);
     ei_x_encode_atom(x, "ok");
 }
 
@@ -355,6 +423,25 @@ static void rdma_drv_control_time(RdmaDrvData *data, ei_x_buff *x) {
     ei_x_encode_ulong(x, data->op_time);
 }
 
+static void rdma_drv_control_accept(RdmaDrvData *data, ei_x_buff *x) {
+    while (!data->new_data);
+
+    RdmaDrvData *new_data = data->new_data;
+
+    ErlDrvTermData spec[] = {
+        ERL_DRV_ATOM, driver_mk_atom("event"),
+            ERL_DRV_ATOM, driver_mk_atom("accept"),
+            ERL_DRV_PORT, driver_mk_port(new_data->port),
+            ERL_DRV_TUPLE, 2,
+        ERL_DRV_TUPLE, 2,
+    };
+
+    erl_drv_output_term(driver_mk_port(data->port), spec, sizeof(spec) / sizeof(spec[0]));
+    ei_x_encode_atom(x, "ok");
+
+    data->new_data = NULL;
+}
+
 static ErlDrvSSizeT rdma_drv_control(ErlDrvData drv_data, unsigned int command, char *buf, ErlDrvSizeT len, char **rbuf, ErlDrvSizeT rlen) {
     RdmaDrvData *data = (RdmaDrvData *) drv_data;
 
@@ -362,6 +449,10 @@ static ErlDrvSSizeT rdma_drv_control(ErlDrvData drv_data, unsigned int command, 
     ei_x_new_with_version(&x);
 
     switch (command) {
+        case DRV_ACCEPT:
+            rdma_drv_control_accept(data, &x);
+            break;
+
         case DRV_CONNECT:
             rdma_drv_control_connect(data, buf, &x);
             break;
