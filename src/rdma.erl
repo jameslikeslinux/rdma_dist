@@ -7,7 +7,6 @@
 
 -record(state_data, {port, queue, caller}).
 
--define(DRV_ACCEPT, $A).
 -define(DRV_CONNECT, $C).
 -define(DRV_LISTEN, $L).
 -define(DRV_PORT, $P).
@@ -102,7 +101,6 @@ listening(accept, From, StateData = #state_data{queue = AcceptQueue}) ->
             {reply, {ok, ClientSocket}, listening, StateData#state_data{queue = NewAcceptQueue}};
 
         {empty, AcceptQueue} ->
-            port_async_control(StateData#state_data.port, ?DRV_ACCEPT, []),
             {next_state, waiting, StateData#state_data{caller = From}}
     end;
 
