@@ -26,6 +26,7 @@ all() -> [
     test_rdma_listen,
     test_rdma_connect,
     test_rdma_accept,
+    test_rdma_port,
     test_rdma_send_recv
 ].
 
@@ -34,11 +35,20 @@ all() -> [
 %% Test Cases
 %%
 test_rdma_listen(_Config) ->
-    {ok, Socket} = rdma:listen(0),
-    ok = rdma:close(Socket).
+    {ok, Listener1} = rdma:listen(0),
+    ok = rdma:close(Listener1),
+    ct:pal("Listens on a random port."),
+
+    {ok, Listener2} = rdma:listen(12345),
+    {ok, 12345} = rdma:port(Listener2),
+    ok = rdma:close(Listener2),
+    ct:pal("Listens on a specified port."),
+
+    {error, eacces} = rdma:listen(1000),
+    ct:pal("Can't listen on a privileged port without privileges.").
 
 test_rdma_connect(_Config) ->
-    {ok, Listener} = rdma:listen(0),
+    {ok, Listener} = rdma:listen(12345),
     {ok, Port} = rdma:port(Listener),
     {ok, Client} = rdma:connect("localhost", Port),
     ok = rdma:close(Client),
@@ -53,6 +63,16 @@ test_rdma_accept(_Config) ->
     ok = rdma:close(Server),
     ok = rdma:close(Listener).
 
+test_rdma_port(_Config) ->
+    Port = 12345,
+    {ok, Listener} = rdma:listen(Port),
+    {ok, Port} = rdma:port(Listener),
+    ct:pal("Retrieves port number from listening socket."),
+
+    rdma:close(Listener),
+    {error, closed} = rdma:port(Listener),
+    ct:pal("Doesn't receive port number from closed socket.").
+
 test_rdma_send_recv(_Config) ->
     {ok, Listener} = rdma:listen(0),
     {ok, Port} = rdma:port(Listener),
@@ -60,18 +80,28 @@ test_rdma_send_recv(_Config) ->
     {ok, Server} = rdma:accept(Listener),
 
     {_, _, Micros1} = os:timestamp(),
-    ok = rdma:send(Client, "test"),
+    ok = rdma:send(Client, "test1"),
     {_, _, Micros2} = os:timestamp(),
-    _Recv1 = rdma:recv(Server),
+    ok = rdma:send(Client, "test2"),
     {_, _, Micros3} = os:timestamp(),
+    {ok, <<"test1">>} = rdma:recv(Server),
+    {_, _, Micros4} = os:timestamp(),
+    {ok, <<"test2">>} = rdma:recv(Server),
+    {_, _, Micros5} = os:timestamp(),
 
-    {ok, Time} = rdma:time(Client),
-    ct:pal("Took ~p micros to send.  Driver took ~p micros.", [Micros2 - Micros1, Time]),
-    ct:pal("Took ~p micros to recv", [Micros3 - Micros2]),
-    ct:pal("Complete time: ~p micros", [Micros3 - Micros1]),
+    {ok, Time1} = rdma:time(Client),
+    {ok, Time2} = rdma:time(Server),
+    ct:pal("Took ~p micros to send 1.  Driver took ~p micros.", [Micros2 - Micros1, Time1]),
+    ct:pal("Took ~p micros to send 2.  Driver took ~p micros.", [Micros3 - Micros2, Time1]),
+    ct:pal("Took ~p micros to recv 1.  Driver took ~p micros.", [Micros4 - Micros3, Time2]),
+    ct:pal("Took ~p micros to recv 2.  Driver took ~p micros.", [Micros5 - Micros4, Time2]),
+    ct:pal("Complete time: ~p micros", [Micros5 - Micros1]),
 
-    ok = rdma:send(Server, "test"),
-    _Recv2 = rdma:recv(Client),
+    ok = rdma:send(Server, <<"test3">>),
+    {ok, <<"test3">>} = rdma:recv(Client),
+
+    ok = rdma:send(Server, <<"foobarbaz">>),
+    {ok, <<"foobarbaz">>} = rdma:recv(Client),
 
     ok = rdma:close(Client),
     ok = rdma:close(Server),

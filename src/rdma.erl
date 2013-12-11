@@ -1,160 +1,142 @@
+%%%
+%%% rdma.erl
+%%% Copyright (C) 2013 James Lee
+%%%
+%%% This program is free software: you can redistribute it and/or modify
+%%% it under the terms of the GNU General Public License as published by
+%%% the Free Software Foundation, either version 3 of the License, or
+%%% (at your option) any later version.
+%%%
+%%% This program is distributed in the hope that it will be useful,
+%%% but WITHOUT ANY WARRANTY; without even the implied warranty of
+%%% MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+%%% GNU General Public License for more details.
+%%%
+%%% You should have received a copy of the GNU General Public License
+%%% along with this program. If not, see <http://www.gnu.org/licenses/>.
+%%%
+
 -module(rdma).
 -author("James Lee <jlee@thestaticvoid.com>").
--behavior(gen_fsm).
 
--export([connect/2, listen/1, accept/1, port/1, send/2, recv/1, close/1, time/1]).
--export([init/1, disconnected/3, connecting/3, connected/3, closed/3, waiting/3, listening/3, handle_sync_event/4, handle_info/3]).
-
--record(state_data, {port, queue, caller}).
+-export([connect/2, connect/3, listen/1, listen/2, accept/1, port/1, send/2, recv/1, close/1, time/1]).
 
 -define(DRV_CONNECT, $C).
 -define(DRV_LISTEN, $L).
 -define(DRV_PORT, $P).
--define(DRV_POLL, $p).
 -define(DRV_TIME, $T).
 
 
 %%
 %% API
 %%
-connect(Host, Port) ->
-    {ok, Socket} = start_link(),
-    case gen_fsm:sync_send_event(Socket, {connect, Host, Port}) of
-        ok    -> {ok, Socket};
-        Other -> Other
+connect(Host, PortNumber) ->
+    connect(Host, PortNumber, []).
+
+connect(Host, PortNumber, Options) ->
+    load_driver(),
+    Port = open_port({spawn, "rdma_drv"}, []),
+
+    HostStr = case inet:ntoa(Host) of
+        {ok, Address}   -> Address;
+        {error, einval} -> Host
+    end,
+
+    case control(Port, ?DRV_CONNECT, term_to_binary([{dest_host, HostStr}, {dest_port, integer_to_list(PortNumber)} | prepare_options_list(Options)])) of
+        ok ->
+            receive
+                {Port, established} ->
+                    {ok, Port}
+            end;
+
+        Error ->
+            close(Port),
+            Error
     end.
 
-listen(Port) ->
-    {ok, Socket} = start_link(),
-    case gen_fsm:sync_send_event(Socket, {listen, Port}) of
-        ok    -> {ok, Socket};
-        Other -> Other
+listen(PortNumber) ->
+    listen(PortNumber, []).
+
+listen(PortNumber, Options) ->
+    load_driver(),
+    Port = open_port({spawn, "rdma_drv"}, []),
+    case control(Port, ?DRV_LISTEN, term_to_binary([{port, PortNumber} | prepare_options_list(Options)])) of
+        ok -> 
+            {ok, Port};
+
+        Error ->
+            close(Port),
+            Error
     end.
 
 accept(Socket) ->
-    gen_fsm:sync_send_event(Socket, accept, infinity).
+    Self = self(),
+    case erlang:port_info(Socket, connected) of
+        {connected, Self} ->
+            receive
+                {Socket, accept, ClientPort} -> {ok, ClientPort}
+            end;
+
+        undefined -> {error, closed};
+        _Other    -> {error, not_owner}
+    end.
 
 port(Socket) ->
-    gen_fsm:sync_send_event(Socket, port).
+    case catch control(Socket, ?DRV_PORT, []) of
+        {'EXIT', {badarg, _}} -> {error, closed};
+        {ok, 0}               -> {error, not_bound};
+        Other                 -> Other
+    end.
 
 send(Socket, Data) ->
-    gen_fsm:sync_send_event(Socket, {send, Data}, infinity).
+    case erlang:port_info(Socket, connected) of
+        undefined ->
+            {error, closed};
+
+        _Else ->
+            port_command(Socket, Data),
+            ok
+    end.
 
 recv(Socket) ->
-    gen_fsm:sync_send_event(Socket, recv, infinity).
+    Self = self(),
+    case erlang:port_info(Socket, connected) of
+        {connected, Self} ->
+            receive
+                {Socket, data, Data} -> {ok, Data}
+            end;
+
+        undefined -> {error, closed};
+        _Other    -> {error, not_owner}
+    end.
 
 close(Socket) ->
-    gen_fsm:sync_send_all_state_event(Socket, close).
+    port_close(Socket),
+    ok.
 
 time(Socket) ->
-    gen_fsm:sync_send_all_state_event(Socket, time).
-
-%%
-%% Callbacks
-%%
-init([]) ->
-    Port = open_port({spawn, "rdma_drv"}, []),
-    {ok, disconnected, #state_data{port = Port, queue = queue:new()}};
-
-init(Port) ->
-    port_connect(Port, self()),
-    % only start polling the cq after the port's owner has been switched
-    port_sync_control(Port, ?DRV_POLL, []),
-    {ok, connected, #state_data{port = Port, queue = queue:new()}}.
-
-disconnected({connect, Host, PortNumber}, From, StateData = #state_data{port = Port}) ->
-    port_async_control(Port, ?DRV_CONNECT, [Host, $:, integer_to_list(PortNumber)]),
-    {next_state, connecting, StateData#state_data{caller = From}};
-
-disconnected({listen, _PortNumber}, _From, StateData = #state_data{port = Port}) ->
-    case port_sync_control(Port, ?DRV_LISTEN, []) of
-        ok    -> {reply, ok, listening, StateData};
-        Other -> {reply, {error, Other}, disconnected, StateData}
+    case catch control(Socket, ?DRV_TIME, []) of
+        {'EXIT', {badarg, _}} -> {error, closed};
+        Other                 -> Other
     end.
 
-connecting(established, _From, StateData) ->
-    {reply, ok, connected, StateData}.
-
-connected({send, Data}, From, StateData = #state_data{port = Port}) ->
-    port_command(Port, Data),
-    {next_state, waiting, StateData#state_data{caller = From}};
-
-connected(recv, From, StateData = #state_data{queue = RecvQueue}) ->
-    case queue:out(RecvQueue) of
-        {{value, Data}, NewRecvQueue} ->
-            {reply, {ok, Data}, connected, StateData#state_data{queue = NewRecvQueue}};
-
-        {empty, RecvQueue} ->
-            {next_state, waiting, StateData#state_data{caller = From}}
-    end;
-
-connected({recv, Data}, _From, StateData = #state_data{queue = RecvQueue}) ->
-    % insert data into receive queue
-    {next_state, connected, StateData#state_data{queue = queue:in(Data, RecvQueue)}}.
-
-closed(_Event, _From, StateData) ->
-    {reply, {error, closed}, closed, StateData}.
-
-listening(accept, From, StateData = #state_data{queue = AcceptQueue}) ->
-    case queue:out(AcceptQueue) of
-        {{value, ClientSocket}, NewAcceptQueue} ->
-            {reply, {ok, ClientSocket}, listening, StateData#state_data{queue = NewAcceptQueue}};
-
-        {empty, AcceptQueue} ->
-            {next_state, waiting, StateData#state_data{caller = From}}
-    end;
-
-listening({accept, Port}, _From, StateData = #state_data{queue = AcceptQueue}) ->
-    {ok, Socket} = start_link(Port),
-    {next_state, listening, StateData#state_data{queue = queue:in(Socket, AcceptQueue)}};
-
-listening(port, _From, StateData = #state_data{port = Port}) ->
-    Reply = port_sync_control(Port, ?DRV_PORT, []),
-    {reply, Reply, listening, StateData}.
-
-waiting(sent, _From, StateData) ->
-    {reply, ok, connected, StateData};
-
-waiting({recv, Data}, _From, StateData) ->
-    {reply, {ok, Data}, connected, StateData};
-
-waiting({accept, Port}, _From, StateData) ->
-    {ok, Socket} = start_link(Port),
-    {reply, {ok, Socket}, listening, StateData}.
-
-handle_sync_event(close, _From, _State, StateData) ->
-    port_close(StateData#state_data.port),
-    {reply, ok, closed, StateData};
-
-handle_sync_event(time, _From, State, StateData) ->
-    {reply, port_sync_control(StateData#state_data.port, ?DRV_TIME, []), State, StateData}.   
-
-handle_info({event, Event}, State, StateData = #state_data{caller = Caller}) ->
-    case ?MODULE:State(Event, Caller, StateData) of
-        {reply, Reply, NextState, NewStateData} ->
-            gen_fsm:reply(Caller, Reply),
-            {next_state, NextState, NewStateData};
-
-        Other ->
-            Other
-    end.
 
 %%
 %% Private Functions
 %%
-start_link() ->
+load_driver() ->
     case erl_ddll:load_driver(code:priv_dir(rdma_dist), "rdma_drv") of
         ok                      -> ok;
         {error, already_loaded} -> ok;
         E                       -> exit(E)
-    end,
-    gen_fsm:start_link(?MODULE, [], []).
+    end.
 
-start_link(Port) ->
-    gen_fsm:start_link(?MODULE, Port, []).
-
-port_sync_control(Port, Command, Args) ->
+control(Port, Command, Args) ->
     binary_to_term(port_control(Port, Command, Args)).
 
-port_async_control(Port, Command, Args) ->
-    port_control(Port, Command, Args).
+prepare_options_list(Options) ->
+    % replace tuple ip address representation with string, if any
+    case proplists:get_value(ip, Options) of
+        undefined -> Options;
+        IpAddress -> [{ip, inet:ntoa(IpAddress)} | proplists:delete(ip, Options)]
+    end.
