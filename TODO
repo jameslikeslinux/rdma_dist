@@ -1,0 +1,2 @@
+* Separate code in to more than one file.
+* Support IPv6 for RDMA CM.  Wouldn't take much...I've just hardcoded AF_INET in several places.

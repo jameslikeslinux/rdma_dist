@@ -19,7 +19,7 @@
 -module(rdma).
 -author("James Lee <jlee@thestaticvoid.com>").
 
--export([connect/2, connect/3, listen/1, listen/2, accept/1, port/1, send/2, recv/1, close/1, time/1]).
+-export([connect/2, connect/3, connect/4, listen/1, listen/2, accept/1, port/1, send/2, recv/1, close/1, time/1]).
 
 -define(DRV_CONNECT, $C).
 -define(DRV_LISTEN, $L).
@@ -34,19 +34,26 @@ connect(Host, PortNumber) ->
     connect(Host, PortNumber, []).
 
 connect(Host, PortNumber, Options) ->
+    connect(Host, PortNumber, Options, 500).
+
+connect(Host, PortNumber, Options, Timeout)->
     load_driver(),
     Port = open_port({spawn, "rdma_drv"}, []),
 
     HostStr = case inet:ntoa(Host) of
-        {ok, Address}   -> Address;
-        {error, einval} -> Host
+        {error, einval} -> Host;
+        Address         -> Address
     end,
 
-    case control(Port, ?DRV_CONNECT, term_to_binary([{dest_host, HostStr}, {dest_port, integer_to_list(PortNumber)} | prepare_options_list(Options)])) of
+    case control(Port, ?DRV_CONNECT, term_to_binary([{dest_host, HostStr}, {dest_port, integer_to_list(PortNumber)}, {timeout, Timeout} | prepare_options_list(Options)])) of
         ok ->
             receive
                 {Port, established} ->
-                    {ok, Port}
+                    {ok, Port};
+
+                {Port, error, Reason} ->
+                    close(Port),
+                    {error, Reason}
             end;
 
         Error ->

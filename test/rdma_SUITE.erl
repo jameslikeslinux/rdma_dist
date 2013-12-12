@@ -49,10 +49,24 @@ test_rdma_listen(_Config) ->
 
 test_rdma_connect(_Config) ->
     {ok, Listener} = rdma:listen(12345),
-    {ok, Port} = rdma:port(Listener),
-    {ok, Client} = rdma:connect("localhost", Port),
-    ok = rdma:close(Client),
-    ok = rdma:close(Listener).
+    {ok, Client1} = rdma:connect("localhost", 12345),
+    ok = rdma:close(Client1),
+    ct:pal("Connects to valid listener by name."),
+
+    {ok, Client2} = rdma:connect({127,0,0,1}, 12345),
+    ok = rdma:close(Client2),
+    ct:pal("Connects to valid listener by IP."),
+
+    {error, _} = rdma:connect("invalid-host", 12345),
+    ct:pal("Doesn't connect to invalid host."),
+
+    {error, _} = rdma:connect("localhost", 54321),
+    ct:pal("Doesn't connect to invalid port."),
+
+    ok = rdma:close(Listener),
+
+    {error, rejected} = rdma:connect("localhost", 12345),
+    ct:pal("Doesn't connect to a closed listener.").
 
 test_rdma_accept(_Config) ->
     {ok, Listener} = rdma:listen(0),
@@ -74,9 +88,9 @@ test_rdma_port(_Config) ->
     ct:pal("Doesn't receive port number from closed socket.").
 
 test_rdma_send_recv(_Config) ->
-    {ok, Listener} = rdma:listen(0),
+    {ok, Listener} = rdma:listen(0, [binary]),
     {ok, Port} = rdma:port(Listener),
-    {ok, Client} = rdma:connect("localhost", Port),
+    {ok, Client} = rdma:connect("localhost", Port, [binary]),
     {ok, Server} = rdma:accept(Listener),
 
     {_, _, Micros1} = os:timestamp(),
