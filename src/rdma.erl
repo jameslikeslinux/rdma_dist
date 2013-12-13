@@ -19,12 +19,14 @@
 -module(rdma).
 -author("James Lee <jlee@thestaticvoid.com>").
 
--export([connect/2, connect/3, connect/4, listen/1, listen/2, accept/1, port/1, send/2, recv/1, close/1, time/1]).
+-export([connect/2, connect/3, connect/4, listen/1, listen/2, accept/1, accept/2, port_number/1, send/2, recv/1, recv/2, close/1, controlling_process/2]).
 
 -define(DRV_CONNECT, $C).
 -define(DRV_LISTEN, $L).
--define(DRV_PORT, $P).
--define(DRV_TIME, $T).
+-define(DRV_PORT_NUMBER, $P).
+-define(DRV_DISCONNECT, $D).
+-define(DRV_PAUSE, $p).
+-define(DRV_RESUME, $r).
 
 
 %%
@@ -38,27 +40,27 @@ connect(Host, PortNumber, Options) ->
 
 connect(Host, PortNumber, Options, Timeout)->
     load_driver(),
-    Port = open_port({spawn, "rdma_drv"}, []),
+    Socket = open_port({spawn, "rdma_drv"}, []),
 
     HostStr = case inet:ntoa(Host) of
-        {error, einval} -> Host;
-        Address         -> Address
+        {error, einval} ->
+            Host;
+        Address ->
+            Address
     end,
 
-    case control(Port, ?DRV_CONNECT, term_to_binary([{dest_host, HostStr}, {dest_port, integer_to_list(PortNumber)}, {timeout, Timeout} | prepare_options_list(Options)])) of
+    case control(Socket, ?DRV_CONNECT, term_to_binary([{dest_host, HostStr}, {dest_port, integer_to_list(PortNumber)}, {timeout, Timeout} | prepare_options_list(Options)])) of
         ok ->
             receive
-                {Port, established} ->
-                    {ok, Port};
-
-                {Port, error, Reason} ->
-                    close(Port),
+                {Socket, established} ->
+                    {ok, Socket};
+                {Socket, error, Reason} ->
+                    close(Socket),
                     {error, Reason}
             end;
-
-        Error ->
-            close(Port),
-            Error
+        {error, Reason} ->
+            close(Socket),
+            {error, Reason}
     end.
 
 listen(PortNumber) ->
@@ -66,65 +68,129 @@ listen(PortNumber) ->
 
 listen(PortNumber, Options) ->
     load_driver(),
-    Port = open_port({spawn, "rdma_drv"}, []),
-    case control(Port, ?DRV_LISTEN, term_to_binary([{port, PortNumber} | prepare_options_list(Options)])) of
+    Socket = open_port({spawn, "rdma_drv"}, []),
+    case control(Socket, ?DRV_LISTEN, term_to_binary([{port, PortNumber} | prepare_options_list(Options)])) of
         ok -> 
-            {ok, Port};
-
-        Error ->
-            close(Port),
-            Error
+            {ok, Socket};
+        {error, Reason} ->
+            close(Socket),
+            {error, Reason}
     end.
 
 accept(Socket) ->
+    accept(Socket, infinity).
+
+accept(Socket, Timeout) ->
     Self = self(),
     case erlang:port_info(Socket, connected) of
         {connected, Self} ->
             receive
-                {Socket, accept, ClientPort} -> {ok, ClientPort}
+                {Socket, accept, ClientPort} ->
+                    {ok, ClientPort};
+                {Socket, error, Reason} ->
+                    close(Socket),
+                    {error, Reason}
+            after Timeout ->
+                {error, timeout}
             end;
-
-        undefined -> {error, closed};
-        _Other    -> {error, not_owner}
+        {connected, _} ->
+            {error, not_owner};
+        undefined ->
+            {error, closed}
     end.
 
-port(Socket) ->
-    case catch control(Socket, ?DRV_PORT, []) of
-        {'EXIT', {badarg, _}} -> {error, closed};
-        {ok, 0}               -> {error, not_bound};
-        Other                 -> Other
+port_number(Socket) ->
+    case catch control(Socket, ?DRV_PORT_NUMBER, []) of
+        {ok, 0} ->
+            {error, not_bound};
+        {ok, PortNumber} ->
+            {ok, PortNumber};
+        {'EXIT', {badarg, _}} ->
+            {error, closed}
     end.
 
 send(Socket, Data) ->
-    case erlang:port_info(Socket, connected) of
-        undefined ->
-            {error, closed};
-
-        _Else ->
-            port_command(Socket, Data),
-            ok
-    end.
-
-recv(Socket) ->
     Self = self(),
     case erlang:port_info(Socket, connected) of
         {connected, Self} ->
             receive
-                {Socket, data, Data} -> {ok, Data}
+                {Socket, error, Reason} ->
+                    close(Socket),
+                    {error, Reason}
+            after 0 ->
+                case catch port_command(Socket, Data) of
+                    true ->
+                        ok;
+                    {'EXIT', {badarg, _}} ->
+                        {error, closed}
+                end
             end;
+        {connected, _} ->
+            {error, not_owner};
+        undefined ->
+            {error, closed}
+    end.
 
-        undefined -> {error, closed};
-        _Other    -> {error, not_owner}
+recv(Socket) ->
+    recv(Socket, infinity).
+
+recv(Socket, Timeout) ->
+    Self = self(),
+    case erlang:port_info(Socket, connected) of
+        {connected, Self} ->
+            receive
+                {Socket, data, Data} ->
+                    {ok, Data};
+                {Socket, error, Reason} ->
+                    close(Socket),
+                    {error, Reason}
+            after Timeout ->
+                {error, timeout}
+            end;
+        {connected, _} ->
+            {error, not_owner};
+        undefined ->
+            {error, closed}
     end.
 
 close(Socket) ->
-    port_close(Socket),
-    ok.
+    Self = self(),
+    case erlang:port_info(Socket, connected) of
+        {connected, Self} ->
+            case control(Socket, ?DRV_DISCONNECT, []) of
+                wait ->
+                    receive
+                        {Socket, disconnected} ->
+                            close_port(Socket),
+                            ok;
+                        {Socket, error, Reason} ->
+                            close_port(Socket),
+                            {error, Reason}
+                    end;
+                ok ->
+                    close_port(Socket),
+                    ok;
+                {error, Reason} ->
+                    close_port(Socket),
+                    {error, Reason}
+            end;
+        {connected, _} ->
+            {error, not_owner};
+        undefined ->
+            ok
+    end.
 
-time(Socket) ->
-    case catch control(Socket, ?DRV_TIME, []) of
-        {'EXIT', {badarg, _}} -> {error, closed};
-        Other                 -> Other
+controlling_process(Socket, Pid) ->
+    % XXX: Rework, checking caller, return values.
+    catch control(Socket, ?DRV_PAUSE, []),
+    case catch port_connect(Socket, Pid) of
+        true ->
+            catch unlink(Socket),
+            forward(Socket, Pid),
+            catch control(Socket, ?DRV_RESUME, []),
+            ok;
+        {'EXIT', {badarg, _}} ->
+            {error, closed}
     end.
 
 
@@ -133,17 +199,43 @@ time(Socket) ->
 %%
 load_driver() ->
     case erl_ddll:load_driver(code:priv_dir(rdma_dist), "rdma_drv") of
-        ok                      -> ok;
-        {error, already_loaded} -> ok;
-        E                       -> exit(E)
+        ok ->
+            ok;
+        {error, already_loaded} ->
+            ok;
+        Error ->
+            exit(Error)
     end.
 
 control(Port, Command, Args) ->
     binary_to_term(port_control(Port, Command, Args)).
 
 prepare_options_list(Options) ->
-    % replace tuple ip address representation with string, if any
+    % Replace tuple ip address representation with string, if any.
     case proplists:get_value(ip, Options) of
-        undefined -> Options;
-        IpAddress -> [{ip, inet:ntoa(IpAddress)} | proplists:delete(ip, Options)]
+        undefined ->
+            Options;
+        IpAddress ->
+            [{ip, inet:ntoa(IpAddress)} | proplists:delete(ip, Options)]
+    end.
+
+close_port(Socket) ->
+    case catch erlang:port_close(Socket) of
+        true ->
+            ok;
+        {'EXIT', {badarg, _}} ->
+            % Socket is already closed.
+            ok
+    end.
+
+forward(Socket, Pid) ->
+    receive
+        {Socket, A} ->
+            Pid ! {Socket, A},
+            forward(Socket, Pid);
+        {Socket, A, B} ->
+            Pid ! {Socket, A, B},
+            forward(Socket, Pid)
+    after 0 ->
+        ok
     end.
