@@ -23,6 +23,7 @@
 
 typedef struct {
     bool binary;
+    bool active;
     int backlog;
     short port;
     char ip[INET6_ADDRSTRLEN];
@@ -34,8 +35,6 @@ typedef struct {
 } RdmaDrvOptions;
 
 void rdma_drv_options_init(RdmaDrvOptions *options);
-bool rdma_drv_options_parse_atom(RdmaDrvOptions *options, char *buf, int *index);
-bool rdma_drv_options_parse_tuple(RdmaDrvOptions *options, char *buf, int *index);
 bool rdma_drv_options_parse(RdmaDrvOptions *options, char *buf);
 
 #endif /* RDMA_DRV_OPTIONS_H */

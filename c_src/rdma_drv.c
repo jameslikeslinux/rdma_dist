@@ -24,15 +24,20 @@
 #include <stdbool.h>
 #include <string.h>
 
+#include <signal.h>
+
 #include "rdma_drv_buffers.h"
 #include "rdma_drv_options.h"
 
-#define DRV_CONNECT     'C'
-#define DRV_LISTEN      'L'
-#define DRV_PORT_NUMBER 'P'
-#define DRV_DISCONNECT  'D'
-#define DRV_PAUSE       'p'
-#define DRV_RESUME      'r'
+#define DRV_CONNECT    'C'
+#define DRV_LISTEN     'L'
+#define DRV_ACCEPT     'A'
+#define DRV_PEERNAME   'P'
+#define DRV_SOCKNAME   'S'
+#define DRV_RECV       'R'
+#define DRV_DISCONNECT 'D'
+#define DRV_STATS      's'
+#define DRV_SETOPTS    'O'
 
 #define ACK (1 << 31)
 
@@ -40,13 +45,16 @@ typedef enum {
     STATE_DISCONNECTED,
     STATE_CONNECTED,
     STATE_LISTENING,
-    STATE_DISCONNECTING
+    STATE_ACCEPTING,
+    STATE_RECEIVING,
+    STATE_DISCONNECTING,
 } RdmaDrvState;
 
-typedef struct {
+typedef struct rdma_drv_data_s {
     RdmaDrvState state;
     RdmaDrvOptions options;
     ErlDrvPort port;
+    ErlDrvTermData caller;
 
     struct rdma_cm_id *id;
     struct rdma_event_channel *ec;
@@ -63,17 +71,38 @@ typedef struct {
     bool sending_ack;
     int pending_acks;
     int peer_ready;
+
+    unsigned long sent;
+    unsigned long received;
+    unsigned long buffered;
+
+    struct rdma_drv_data_s *accepted;
+    struct rdma_drv_data_s *listener;
 } RdmaDrvData;
 
-static void rdma_drv_send_error_atom(RdmaDrvData *data, char *str) {
-    ErlDrvTermData spec[] = {
-        ERL_DRV_PORT, driver_mk_port(data->port),
-        ERL_DRV_ATOM, driver_mk_atom("error"),
-        ERL_DRV_ATOM, driver_mk_atom(str),
-        ERL_DRV_TUPLE, 3,
-    };
+#include <signal.h>
 
-    erl_drv_output_term(driver_mk_port(data->port), spec, sizeof(spec) / sizeof(spec[0]));
+static void rdma_drv_send_error_atom(RdmaDrvData *data, char *str) {
+    if (data->options.active) {
+        /* dist_util seems to expect {tcp_closed, Socket} */
+        ErlDrvTermData spec[] = {
+            ERL_DRV_ATOM, driver_mk_atom("tcp_closed"),
+            ERL_DRV_PORT, driver_mk_port(data->port),
+            ERL_DRV_TUPLE, 2,
+        };
+
+        erl_drv_output_term(driver_mk_port(data->port), spec, sizeof(spec) / sizeof(spec[0]));
+    } else {
+        ErlDrvTermData spec[] = {
+            ERL_DRV_PORT, driver_mk_port(data->port),
+                ERL_DRV_ATOM, driver_mk_atom("error"),
+                ERL_DRV_ATOM, driver_mk_atom(str),
+                ERL_DRV_TUPLE, 2,
+            ERL_DRV_TUPLE, 2,
+        };
+
+        erl_drv_send_term(driver_mk_port(data->port), data->caller, spec, sizeof(spec) / sizeof(spec[0]));
+    }
 }
 
 static void rdma_drv_pause(RdmaDrvData *data) {
@@ -87,6 +116,9 @@ static void rdma_drv_pause(RdmaDrvData *data) {
 }
 
 static void rdma_drv_resume(RdmaDrvData *data) {
+    /* Save who to reply to. */
+    data->caller = driver_caller(data->port);
+
     if (data->ec) {
         driver_select(data->port, (ErlDrvEvent) data->ec->fd, ERL_DRV_READ, 1);
     }
@@ -253,13 +285,6 @@ static bool rdma_drv_init_ibverbs(RdmaDrvData *data) {
      */
     data->peer_ready = data->options.num_buffers - 1;
 
-    /*
-     * If we've made it this far, then ibverbs have been initialized
-     * successfully, so tell the driver to start polling the completion
-     * channel.
-     */
-    rdma_drv_resume(data);
-
     return true;
 }
 
@@ -321,6 +346,16 @@ static void rdma_drv_stop(ErlDrvData drv_data) {
 
     /* Stop polling event channels. */
     rdma_drv_pause(data);
+
+    /* Close any accepted sockets. */
+    if (data->accepted) {
+        driver_failure_eof(data->accepted->port);
+        data->accepted = NULL;
+    }
+
+    if (data->listener) {
+        data->listener->accepted = NULL;
+    }
 
     rdma_drv_free_ibverbs(data); 
 
@@ -385,6 +420,14 @@ static bool rdma_drv_flush_queue(RdmaDrvData *data) {
 static void rdma_drv_output(ErlDrvData drv_data, char *buf, ErlDrvSizeT len) {
     RdmaDrvData *data = (RdmaDrvData *) drv_data;
 
+    /* Save who to reply to. */
+    data->caller = driver_caller(data->port);
+
+    if (data->state != STATE_CONNECTED) {
+        rdma_drv_send_error_atom(data, "not_connected");
+        return;
+    }
+
     if (rdma_drv_flush_queue(data)) {
         ErlDrvSizeT remaining = rdma_drv_send_fully(data, buf, len, false);
         if (remaining > 0) {
@@ -414,7 +457,7 @@ static void rdma_drv_handle_rdma_cm_event_connect_request(RdmaDrvData *data, str
     }
 
     memset(new_data, 0, sizeof(RdmaDrvData));
-    new_port = driver_create_port(data->port, driver_connected(data->port), "rdma_drv", (ErlDrvData) new_data);
+    new_port = driver_create_port(data->port, data->caller, "rdma_drv", (ErlDrvData) new_data);
 
     /* ei is used in the control interface. */
     set_port_control_flags(new_port, PORT_CONTROL_FLAG_BINARY);
@@ -422,6 +465,17 @@ static void rdma_drv_handle_rdma_cm_event_connect_request(RdmaDrvData *data, str
     new_data->id = cm_event->id;
     new_data->port = new_port;
     new_data->options = data->options;
+
+    /* Send the port to Erlang. */
+    ErlDrvTermData spec[] = {
+        ERL_DRV_PORT, driver_mk_port(data->port),
+            ERL_DRV_ATOM, driver_mk_atom("port"),
+            ERL_DRV_PORT, driver_mk_port(new_port),
+            ERL_DRV_TUPLE, 2,
+        ERL_DRV_TUPLE, 2,
+    };
+
+    erl_drv_send_term(driver_mk_port(data->port), data->caller, spec, sizeof(spec) / sizeof(spec[0]));
 
     /*
      * For better or worse, events related to the new socket still come
@@ -445,7 +499,7 @@ static void rdma_drv_handle_rdma_cm_event_connect_request(RdmaDrvData *data, str
 static void rdma_drv_handle_rdma_cm_event_addr_resolved(RdmaDrvData *data, struct rdma_cm_event *cm_event) {
     int ret;
 
-    ret = rdma_resolve_route(data->id, data->options.timeout);
+    ret = rdma_resolve_route(data->id, data->options.timeout / 4);
     if (ret) {
         rdma_drv_send_error_atom(data, "rdma_resolve_route");
         return;
@@ -468,17 +522,32 @@ static void rdma_drv_handle_rdma_cm_event_route_resolved(RdmaDrvData *data, stru
 static void rdma_drv_handle_rdma_cm_event_established(RdmaDrvData *data, struct rdma_cm_event *cm_event) {
     if (cm_event->id->context) {
         RdmaDrvData *new_data = (RdmaDrvData *) cm_event->id->context;
+        new_data->state = STATE_CONNECTED;
+        data->accepted = new_data;
+        new_data->listener = data;
 
         ErlDrvTermData spec[] = {
             ERL_DRV_PORT, driver_mk_port(data->port),
-            ERL_DRV_ATOM, driver_mk_atom("accept"),
-            ERL_DRV_PORT, driver_mk_port(new_data->port),
-            ERL_DRV_TUPLE, 3,
+                ERL_DRV_ATOM, driver_mk_atom("accept"),
+                ERL_DRV_PORT, driver_mk_port(new_data->port),
+                ERL_DRV_TUPLE, 2,
+            ERL_DRV_TUPLE, 2,
         };
 
-        erl_drv_output_term(driver_mk_port(data->port), spec, sizeof(spec) / sizeof(spec[0]));
+        erl_drv_send_term(driver_mk_port(data->port), data->caller, spec, sizeof(spec) / sizeof(spec[0]));
 
-        new_data->state = STATE_CONNECTED;
+        data->state = STATE_LISTENING;
+
+        if (new_data->options.active) {
+            /*
+             * If the listener was configured to be "active", we want
+             * to start polling the accepted socket for recvs.
+             */
+            rdma_drv_resume(new_data);
+        }
+
+        /* We've completed an accept, so stop polling. */
+        rdma_drv_pause(data);
     } else {
         ErlDrvTermData spec[] = {
             ERL_DRV_PORT, driver_mk_port(data->port),
@@ -486,9 +555,14 @@ static void rdma_drv_handle_rdma_cm_event_established(RdmaDrvData *data, struct 
             ERL_DRV_TUPLE, 2,
         };
 
-        erl_drv_output_term(driver_mk_port(data->port), spec, sizeof(spec) / sizeof(spec[0]));
+        erl_drv_send_term(driver_mk_port(data->port), data->caller, spec, sizeof(spec) / sizeof(spec[0]));
 
         data->state = STATE_CONNECTED;
+
+        /* Stop polling for events unless this is an active socket. */
+        if (!data->options.active) {
+            rdma_drv_pause(data);
+        }
     }
 }
 
@@ -584,6 +658,10 @@ static void rdma_drv_handle_rdma_cm_event(RdmaDrvData *data) {
             rdma_drv_handle_rdma_cm_event_disconnected(data, cm_event);
             break;
 
+        case RDMA_CM_EVENT_TIMEWAIT_EXIT:
+            /* XXX: Should we do anything here? */
+            break;
+
         default:
             rdma_drv_send_error_atom(data, "unhandled_event");
             break;
@@ -596,7 +674,8 @@ static void rdma_drv_handle_rdma_cm_event(RdmaDrvData *data) {
     }
 }
 
-static void rdma_drv_handle_recv_complete(RdmaDrvData *data, struct ibv_wc *wc) {
+static bool rdma_drv_handle_recv_complete(RdmaDrvData *data, struct ibv_wc *wc) {
+    bool completed = false;
     uint32_t imm_data = ntohl(wc->imm_data);
     void *recv_buffer = rdma_drv_buffers_current_buffer(&data->recv_buffers);
 
@@ -614,7 +693,7 @@ static void rdma_drv_handle_recv_complete(RdmaDrvData *data, struct ibv_wc *wc) 
 
             if (!data->incomplete_recv) {
                 rdma_drv_send_error_atom(data, "driver_alloc_recv");
-                return;
+                return false;
             }
         }
 
@@ -624,34 +703,56 @@ static void rdma_drv_handle_recv_complete(RdmaDrvData *data, struct ibv_wc *wc) 
         }
 
         if (remaining <= data->options.buffer_size) {
+            void *output_buffer;
+            ErlDrvSizeT output_buffer_size;
+
             if (data->incomplete_recv) {
-                ErlDrvTermData spec[] =  {
-                    ERL_DRV_PORT, driver_mk_port(data->port),
-                    ERL_DRV_ATOM, driver_mk_atom("data"),
-                    data->options.binary ? ERL_DRV_BUF2BINARY : ERL_DRV_STRING, (ErlDrvTermData) data->incomplete_recv, data->incomplete_recv_offset,
-                    ERL_DRV_TUPLE, 3,
-                }; 
+                output_buffer = data->incomplete_recv;
+                output_buffer_size = data->incomplete_recv_offset;
+            } else {
+                output_buffer = recv_buffer;
+                output_buffer_size = remaining;
+            }
 
-                erl_drv_output_term(driver_mk_port(data->port), spec, sizeof(spec) / sizeof(spec[0]));
+            ErlDrvTermData spec[] = {
+                ERL_DRV_PORT, driver_mk_port(data->port),
+                    ERL_DRV_ATOM, driver_mk_atom("foo"),
+                    data->options.binary ? ERL_DRV_BUF2BINARY : ERL_DRV_STRING, (ErlDrvTermData) output_buffer, output_buffer_size,
+                    ERL_DRV_TUPLE, 2,
+                ERL_DRV_TUPLE, 2,
+            }; 
 
+            if (data->options.active) {
+//                erl_drv_output_term(driver_mk_port(data->port), spec, sizeof(spec) / sizeof(spec[0]));
+                driver_output2(data->port, output_buffer, output_buffer_size, NULL, 0);
+            } else {
+                driver_output2(data->port, output_buffer, output_buffer_size, NULL, 0);
+                //erl_drv_send_term(driver_mk_port(data->port), data->caller, spec, sizeof(spec) / sizeof(spec[0]));
+
+                /* Stop polling for events. */
+                rdma_drv_pause(data);
+
+                data->state = STATE_CONNECTED;                
+
+                /* Return false so we don't process any more cq entries. */
+                completed = true;
+            }
+
+            if (data->incomplete_recv) {
                 driver_free(data->incomplete_recv);
                 data->incomplete_recv = NULL;
                 data->incomplete_recv_offset = 0;
-            } else {
-                ErlDrvTermData spec[] =  {
-                    ERL_DRV_PORT, driver_mk_port(data->port),
-                    ERL_DRV_ATOM, driver_mk_atom("data"),
-                    data->options.binary ? ERL_DRV_BUF2BINARY : ERL_DRV_STRING, (ErlDrvTermData) recv_buffer, remaining,
-                    ERL_DRV_TUPLE, 3,
-                };   
-
-                erl_drv_output_term(driver_mk_port(data->port), spec, sizeof(spec) / sizeof(spec[0]));
             }
+
+            /* Increment the stats counter. */
+            data->received++;
         }
 
         rdma_drv_post_recv(data, recv_buffer);
         data->pending_acks++;
     }
+
+    return completed;
 }
 
 static void rdma_drv_handle_send_complete(RdmaDrvData *data, struct ibv_wc *wc) {
@@ -660,27 +761,51 @@ static void rdma_drv_handle_send_complete(RdmaDrvData *data, struct ibv_wc *wc) 
     } else {
         rdma_drv_buffers_release_buffer(&data->send_buffers);
         rdma_drv_flush_queue(data);
+
+        /* Increment the stats counter. */
+        data->sent++;
     }
+}
+
+static bool rdma_drv_flush_cq(RdmaDrvData *data) {
+    bool completed = false;
+    struct ibv_wc wc;
+
+    while (!completed && ibv_poll_cq(data->cq, 1, &wc)) {
+        if (wc.status == IBV_WC_SUCCESS) {
+            if (wc.opcode == IBV_WC_RECV) {
+                //data->received += wc.byte_len;
+                //data->received++;
+                completed = rdma_drv_handle_recv_complete(data, &wc);
+            } else if (wc.opcode == IBV_WC_SEND) {
+                //data->sent += wc.byte_len;
+                //data->sent++;
+                //data->buffered -= wc.byte_len;
+                rdma_drv_handle_send_complete(data, &wc);
+            }
+        }
+
+        /* XXX: What to do about unsuccessful work items? */
+    }
+
+    rdma_drv_post_ack(data);
+
+    /* Queue flushed completely. */
+    return completed;
 }
 
 static void rdma_drv_handle_comp_channel_event(RdmaDrvData *data) {
     void *ev_ctx;
     struct ibv_cq *cq;
-    struct ibv_wc wc;
 
+    /* XXX: Check error status of these functions. */
     ibv_get_cq_event(data->comp_channel, &cq, &ev_ctx);
     ibv_ack_cq_events(cq, 1);
+
+    /* Request a completion queue event in the completion channel. */
     ibv_req_notify_cq(cq, 0);
 
-    while (ibv_poll_cq(cq, 1, &wc)) {
-        if (wc.opcode & IBV_WC_RECV) {
-            rdma_drv_handle_recv_complete(data, &wc);
-        } else if (wc.opcode == IBV_WC_SEND) {
-            rdma_drv_handle_send_complete(data, &wc);
-        }
-    }
-
-    rdma_drv_post_ack(data);
+    rdma_drv_flush_cq(data);
 }
 
 static void rdma_drv_ready_input(ErlDrvData drv_data, ErlDrvEvent event) {
@@ -760,7 +885,7 @@ static void rdma_drv_control_connect(RdmaDrvData *data, char *buf, ei_x_buff *x)
         return;
     }
 
-    ret = rdma_resolve_addr(data->id, (struct sockaddr *) &src_addr, addr->ai_addr, data->options.timeout);
+    ret = rdma_resolve_addr(data->id, (struct sockaddr *) &src_addr, addr->ai_addr, data->options.timeout / 4);
     if (ret) {
         rdma_drv_encode_error_posix(x, errno);
         return;
@@ -768,10 +893,10 @@ static void rdma_drv_control_connect(RdmaDrvData *data, char *buf, ei_x_buff *x)
 
     freeaddrinfo(addr);
 
-    /*
-     * If we've made it this far, rdmacm is set up properly, so tell
-     * the driver to start polling the event channel.
-     */
+    /* Save who to reply to. */
+    data->caller = driver_caller(data->port);
+
+    /* Start polling for events. */
     rdma_drv_resume(data);
 
     ei_x_encode_atom(x, "ok");
@@ -827,20 +952,86 @@ static void rdma_drv_control_listen(RdmaDrvData *data, char *buf, ei_x_buff *x) 
         return;
     }
 
-    /*
-     * If we've made it this far, rdmacm is set up properly, so tell
-     * the driver to start polling the event channel.
-     */
-    rdma_drv_resume(data);
-
     data->state = STATE_LISTENING;
     ei_x_encode_atom(x, "ok");
 }
 
-static void rdma_drv_control_port_number(RdmaDrvData *data, ei_x_buff *x) {
+static void rdma_drv_control_accept(RdmaDrvData *data, ei_x_buff *x) {
+/* XXX: Handle case of accepting from same process
+    if (data->state == STATE_ACCEPTING) {
+        rdma_drv_encode_error_atom(x, "already_accepting");
+        return;
+    }
+
+    if (data->state != STATE_LISTENING) {
+        rdma_drv_encode_error_atom(x, "not_listening");
+        return;
+    }
+*/
+
+    data->state = STATE_ACCEPTING;
+
+    /* Start polling. */
+    rdma_drv_resume(data);
+
+    ei_x_encode_atom(x, "ok");
+}    
+
+static void rdma_drv_control_peername(RdmaDrvData *data, ei_x_buff *x) {
+    struct sockaddr_in *addr = (struct sockaddr_in *) rdma_get_peer_addr(data->id);
+
     ei_x_encode_tuple_header(x, 2);
     ei_x_encode_atom(x, "ok");
+    ei_x_encode_tuple_header(x, 2);
+    ei_x_encode_string(x, inet_ntoa(addr->sin_addr));
+    ei_x_encode_ulong(x, ntohs(rdma_get_dst_port(data->id)));
+}
+
+static void rdma_drv_control_sockname(RdmaDrvData *data, ei_x_buff *x) {
+    struct sockaddr_in *addr = (struct sockaddr_in *) rdma_get_local_addr(data->id);
+
+    ei_x_encode_tuple_header(x, 2);
+    ei_x_encode_atom(x, "ok");
+    ei_x_encode_tuple_header(x, 2);
+    ei_x_encode_string(x, inet_ntoa(addr->sin_addr));
     ei_x_encode_ulong(x, ntohs(rdma_get_src_port(data->id)));
+}
+
+static void rdma_drv_control_recv(RdmaDrvData *data, ei_x_buff *x) {
+    if (data->options.active) {
+        if (driver_caller(data->port) != driver_connected(data->port)) {
+            rdma_drv_encode_error_atom(x, "not_owner");
+            return;
+        }
+    } else {
+        if (data->state == STATE_RECEIVING) {
+            rdma_drv_encode_error_atom(x, "already_receiving");
+            return;
+        }
+
+        if (data->state == STATE_DISCONNECTED) {
+            rdma_drv_encode_error_atom(x, "closed");
+            return;
+        }
+
+        if (data->state != STATE_CONNECTED) {
+            rdma_drv_encode_error_atom(x, "not_connected");
+            return;
+        }
+
+        /*
+         * Caller needs to be set in case rdma_drv_flush_cq needs to
+         * output anytihng.
+         */
+        data->caller = driver_caller(data->port);
+        if (!rdma_drv_flush_cq(data)) {
+            /* Flushing did not complete a receive, so start polling. */
+            data->state = STATE_RECEIVING;
+            rdma_drv_resume(data);
+        }
+    }
+
+    ei_x_encode_atom(x, "ok");
 }
 
 static void rdma_drv_control_disconnect(RdmaDrvData *data, ei_x_buff *x) {
@@ -848,7 +1039,7 @@ static void rdma_drv_control_disconnect(RdmaDrvData *data, ei_x_buff *x) {
 
     /*
      * We only need to initiate a proper disconnection for fully
-     * connected sockets.  Listeners or other sockets in the process
+     * connected sockets. Listeners or other sockets in the process
      * of disconnecting don't need to do anything.
      */
 
@@ -860,6 +1051,10 @@ static void rdma_drv_control_disconnect(RdmaDrvData *data, ei_x_buff *x) {
         }
 
         data->state = STATE_DISCONNECTING;
+
+        /* Start polling for disconnection. */
+        rdma_drv_resume(data);
+
         ei_x_encode_atom(x, "wait");
         return;
     }
@@ -867,13 +1062,29 @@ static void rdma_drv_control_disconnect(RdmaDrvData *data, ei_x_buff *x) {
     ei_x_encode_atom(x, "ok");
 }
 
-static void rdma_drv_control_pause(RdmaDrvData *data, ei_x_buff *x) {
-    rdma_drv_pause(data); 
+static void rdma_drv_control_stats(RdmaDrvData *data, ei_x_buff *x) {
+    ei_x_encode_tuple_header(x, 4);
     ei_x_encode_atom(x, "ok");
+    ei_x_encode_ulong(x, data->received);
+    ei_x_encode_ulong(x, data->sent);
+    ei_x_encode_ulong(x, data->buffered);
 }
 
-static void rdma_drv_control_resume(RdmaDrvData *data, ei_x_buff *x) {
-    rdma_drv_resume(data); 
+static void rdma_drv_control_setopts(RdmaDrvData *data, char *buf, ei_x_buff *x) {
+    /* Parse the connection options */
+    if (!rdma_drv_options_parse(&data->options, buf)) {
+        rdma_drv_encode_error_atom(x, "bad_options");
+        return;
+    }
+
+    if (data->options.active) {
+        /* Start polling. */
+        rdma_drv_resume(data);
+    } else {
+        /* Stop polling. */
+        rdma_drv_resume(data);
+    }
+
     ei_x_encode_atom(x, "ok");
 }
 
@@ -901,20 +1112,32 @@ static ErlDrvSSizeT rdma_drv_control(ErlDrvData drv_data, unsigned int command, 
             rdma_drv_control_listen(data, buf, &x);
             break;
 
-        case DRV_PORT_NUMBER:
-            rdma_drv_control_port_number(data, &x);
+        case DRV_ACCEPT:
+            rdma_drv_control_accept(data, &x);
+            break;
+
+        case DRV_PEERNAME:
+            rdma_drv_control_peername(data, &x);
+            break;
+
+        case DRV_SOCKNAME:
+            rdma_drv_control_sockname(data, &x);
+            break;
+
+        case DRV_RECV:
+            rdma_drv_control_recv(data, &x);
             break;
 
         case DRV_DISCONNECT:
             rdma_drv_control_disconnect(data, &x);
             break;
 
-        case DRV_PAUSE:
-            rdma_drv_control_pause(data, &x);
+        case DRV_STATS:
+            rdma_drv_control_stats(data, &x);
             break;
 
-        case DRV_RESUME:
-            rdma_drv_control_resume(data, &x);
+        case DRV_SETOPTS:
+            rdma_drv_control_setopts(data, buf, &x);
             break;
 
         default:

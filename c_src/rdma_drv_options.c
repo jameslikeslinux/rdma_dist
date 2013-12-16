@@ -23,38 +23,42 @@
 
 void rdma_drv_options_init(RdmaDrvOptions *options) {
     options->binary = false;
+    options->active = false;
     options->backlog = 5;
     options->port = 0;
     options->buffer_size = 1024;
     options->num_buffers = 100;
 }
 
-bool rdma_drv_options_parse_atom(RdmaDrvOptions *options, char *buf, int *index) {
-    char atom[MAXATOMLEN];
-
-    if (ei_decode_atom(buf, index, atom) == 0) {
-        if (strcmp(atom, "list") == 0) {
-            options->binary = false;
-        } else if (strcmp(atom, "binary") == 0) {
-            options->binary = true;
-        } else {
-            return false;
-        }
-    } else {
-        return false;
-    }
-
-    return true;
-}
-
-bool rdma_drv_options_parse_tuple(RdmaDrvOptions *options, char *buf, int *index) {
+static bool rdma_drv_options_parse_tuple(RdmaDrvOptions *options, char *buf, int *index) {
     int arity = 0;
 
     if (ei_decode_tuple_header(buf, index, &arity) == 0) {
         char atom[MAXATOMLEN];
 
         if (ei_decode_atom(buf, index, atom) == 0) {
-            if (strcmp(atom, "backlog") == 0) {
+            if (strcmp(atom, "list") == 0) {
+                int list = 0;
+                if (ei_decode_boolean(buf, index, &list) == 0) {
+                    options->binary = !((bool) list);
+                } else {
+                    return false;
+                }
+            } else if (strcmp(atom, "binary") == 0) {
+                int binary = 0;
+                if (ei_decode_boolean(buf, index, &binary) == 0) {
+                    options->binary = (bool) binary;
+                } else {
+                    return false;
+                }
+            } else if (strcmp(atom, "active") == 0) {
+                int active = 0;
+                if (ei_decode_boolean(buf, index, &active) == 0) {
+                    options->active = (bool) active;
+                } else {
+                    return false;
+                }
+            } else if (strcmp(atom, "backlog") == 0) {
                 long backlog = 0;
                 if (ei_decode_long(buf, index, &backlog) == 0) {
                     options->backlog = (int) backlog;
@@ -132,12 +136,6 @@ bool rdma_drv_options_parse(RdmaDrvOptions *options, char *buf) {
 
             if (ei_get_type(buf, &index, &type, &size) == 0) {
                 switch (type) {
-                    case ERL_ATOM_EXT:
-                        if (!rdma_drv_options_parse_atom(options, buf, &index)) {
-                            return false;
-                        }
-                        break;
-
                     case ERL_SMALL_TUPLE_EXT:
                         if (!rdma_drv_options_parse_tuple(options, buf, &index)) {
                             return false;

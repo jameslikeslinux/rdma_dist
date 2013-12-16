@@ -4,7 +4,7 @@ compile:
 	./rebar compile
 
 run: compile
-	ERL_LIBS=$(shell readlink -f ..) erl +K true
+	erl +K true -pa ebin -name test@login-1-ib.deepthought.umd.edu -proto_dist rdma
 
 test: compile
 	./rebar -v skip_deps=true ct

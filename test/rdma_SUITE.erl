@@ -26,7 +26,7 @@ all() -> [
     test_rdma_listen,
     test_rdma_connect,
     test_rdma_accept,
-    test_rdma_port_number,
+    test_rdma_sockname,
     test_rdma_send_recv_binary,
     test_rdma_send_recv_list,
     test_rdma_close,
@@ -43,15 +43,24 @@ test_rdma_listen(_Config) ->
     ct:pal("Listens on a random port."),
 
     {ok, Listener2} = rdma:listen(12345),
-    {ok, 12345} = rdma:port_number(Listener2),
+    {ok, {_IPAddress, 12345}} = rdma:sockname(Listener2),
     ok = rdma:close(Listener2),
     ct:pal("Listens on a specified port."),
 
     {error, eacces} = rdma:listen(1000),
     ct:pal("Can't listen on a privileged port without privileges.").
 
+acceptor(Listener) ->
+    case rdma:accept(Listener) of
+        {ok, _Socket} ->
+            acceptor(Listener);
+        _ ->
+            ok
+    end.
+
 test_rdma_connect(_Config) ->
     {ok, Listener} = rdma:listen(12345),
+    spawn(?MODULE, acceptor, [Listener]),
     {ok, Client1} = rdma:connect("localhost", 12345),
     ok = rdma:close(Client1),
     ct:pal("Connects to valid listener by name."),
@@ -68,37 +77,34 @@ test_rdma_connect(_Config) ->
 
     ok = rdma:close(Listener),
 
-    {error, rejected} = rdma:connect("localhost", 12345),
+    {error, _} = rdma:connect("localhost", 12345),
     ct:pal("Doesn't connect to a closed listener.").
 
 test_rdma_accept(_Config) ->
     {ok, Listener} = rdma:listen(12345),
+    spawn(?MODULE, acceptor, [Listener]),
     {ok, Client} = rdma:connect("localhost", 12345),
-    {ok, Server} = rdma:accept(Listener),
     ok = rdma:close(Client),
-    ok = rdma:close(Server),
     ok = rdma:close(Listener).
 
-test_rdma_port_number(_Config) ->
+test_rdma_sockname(_Config) ->
     PortNumber = 12345,
     {ok, Listener} = rdma:listen(PortNumber),
-    {ok, PortNumber} = rdma:port_number(Listener),
-    ct:pal("Retrieves port number from listening socket."),
+    spawn(?MODULE, acceptor, [Listener]),
+    {ok, {{0,0,0,0}, PortNumber}} = rdma:sockname(Listener),
+    ct:pal("Retrieves sockname from listening socket."),
 
     {ok, Client} = rdma:connect("localhost", PortNumber),
-    {ok, Server} = rdma:accept(Listener),
+    {ok, _} = rdma:sockname(Client),
+    ct:pal("Retrieves sockname from client socket."),
 
-    {ok, _} = rdma:port_number(Client),
-    ct:pal("Retrieves port number from client socket."),
-
-    {ok, _} = rdma:port_number(Server),
-    ct:pal("Retrieves port number from server socket."),
+%    {ok, _} = rdma:sockname(Server),
+%    ct:pal("Retrieves sockname from server socket."),
 
     ok = rdma:close(Client),
-    ok = rdma:close(Server),
     ok = rdma:close(Listener),
-    {error, closed} = rdma:port_number(Listener),
-    ct:pal("Doesn't receive port number from closed socket.").
+    {error, closed} = rdma:sockname(Listener),
+    ct:pal("Doesn't receive sockname from closed socket.").
 
 test_rdma_send_recv_binary(_Config) ->
     {ok, Listener} = rdma:listen(12345, [binary]),
@@ -107,9 +113,15 @@ test_rdma_send_recv_binary(_Config) ->
 
     ok = rdma:send(Server, <<"foo">>),
     {ok, <<"foo">>} = rdma:recv(Client),
+    ct:pal("Can send and receive a binary."),
 
     ok = rdma:send(Server, "bar"),
     {ok, <<"bar">>} = rdma:recv(Client),
+    ct:pal("Can send a list and receive as a binary."),
+
+    ok = rdma:send(Server, <<>>),
+    {ok, <<>>} = rdma:recv(Client),
+    ct:pal("Can send and receive a zero byte binary."),
 
     ok = rdma:close(Client),
     {error, closed} = rdma:send(Client, <<"baz">>),
@@ -127,11 +139,17 @@ test_rdma_send_recv_list(_Config) ->
     {ok, Client} = rdma:connect("localhost", 12345, [list]),
     {ok, Server} = rdma:accept(Listener),
 
-    ok = rdma:send(Server, <<"foo">>),
-    {ok, "foo"} = rdma:recv(Client),
-
     ok = rdma:send(Server, "bar"),
     {ok, "bar"} = rdma:recv(Client),
+    ct:pal("Can send and receive a list."),
+
+    ok = rdma:send(Server, <<"foo">>),
+    {ok, "foo"} = rdma:recv(Client),
+    ct:pal("Can send a binary and receive as a list."),
+
+    ok = rdma:send(Server, []),
+    {ok, []} = rdma:recv(Client),
+    ct:pal("Can send and receive a zero byte list."),
 
     ok = rdma:close(Server),
     timer:sleep(100),
@@ -151,31 +169,29 @@ test_rdma_close(_Config) ->
 
     {ok, Listener2} = rdma:listen(12345),
     TestCasePid = self(),
-    spawn(fun() -> {error, not_owner} = rdma:close(Listener2), TestCasePid ! continue end),
+    spawn(fun() -> ok = rdma:close(Listener2), TestCasePid ! continue end),
     receive continue -> ok end,
-    ct:pal("Doesn't close socket from another process."),
+    ct:pal("Closes socket from another process."),
     ok = rdma:close(Listener2).
 
 test_rdma_controlling_process(_Config) ->
-    {ok, Listener} = rdma:listen(12345, [binary]),
-    {ok, Client} = rdma:connect("localhost", 12345, [binary]),
+    {ok, Listener} = rdma:listen(12345),
+    {ok, Client} = rdma:connect("localhost", 12345),
     {ok, Server} = rdma:accept(Listener),
 
-    rdma:send(Client, <<"foo">>),
+    rdma:send(Client, "foo"),
     timer:sleep(100),
 
     TestCasePid = self(),
     Pid = spawn(fun() ->
-        receive continue -> ok end,
-        {ok, <<"foo">>} = rdma:recv(Server, 100),
-        {ok, <<"bar">>} = rdma:recv(Server, 100),
-        rdma:close(Server),
+        {ok, "foo"} = rdma:recv(Server, 100),
+        {ok, "bar"} = rdma:recv(Server, 100),
+        ok = rdma:close(Server),
         TestCasePid ! continue
     end),
 
-    rdma:controlling_process(Server, Pid),
-    Pid ! continue, 
-    rdma:send(Client, <<"bar">>),
+    ok = rdma:controlling_process(Server, Pid),
+    rdma:send(Client, "bar"),
     receive continue -> ok end,
 
     ct:pal("Can transfer controlling process of socket."),
