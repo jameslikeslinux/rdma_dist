@@ -2,18 +2,16 @@
  * rdma_drv.c
  * Copyright (C) 2013 James Lee
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
+ * The contents of this file are subject to the Erlang Public License,
+ * Version 1.1, (the "License"); you may not use this file except in
+ * compliance with the License. You should have received a copy of the
+ * Erlang Public License along with this software. If not, it can be
+ * retrieved online at http://www.erlang.org/.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program. If not, see <http://www.gnu.org/licenses/>.
+ * Software distributed under the License is distributed on an "AS IS"
+ * basis, WITHOUT WARRANTY OF ANY KIND, either express or implied. See
+ * the License for the specific language governing rights and limitations
+ * under the License.
  */
 
 #include <arpa/inet.h>
@@ -588,7 +586,7 @@ static void rdma_drv_handle_rdma_cm_event_disconnected(RdmaDrvData *data, struct
             ERL_DRV_TUPLE, 2,
         };
 
-        erl_drv_output_term(driver_mk_port(data->port), spec, sizeof(spec) / sizeof(spec[0]));
+        erl_drv_send_term(driver_mk_port(data->port), data->caller, spec, sizeof(spec) / sizeof(spec[0]));
     } else {
         /*
          * This event is the result of the peer calling
@@ -854,7 +852,7 @@ static void rdma_drv_control_connect(RdmaDrvData *data, char *buf, ei_x_buff *x)
         rdma_drv_encode_error_posix(x, errno);
         return;
     } else if (ret) {
-        rdma_drv_encode_error_string(x, gai_strerror(ret));
+        rdma_drv_encode_error_atom(x, "getaddrinfo");
         return;
     }
 
@@ -1053,6 +1051,7 @@ static void rdma_drv_control_disconnect(RdmaDrvData *data, ei_x_buff *x) {
         data->state = STATE_DISCONNECTING;
 
         /* Start polling for disconnection. */
+        /* XXX: Maybe only if we're a client socket. */
         rdma_drv_resume(data);
 
         ei_x_encode_atom(x, "wait");
