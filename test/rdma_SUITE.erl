@@ -104,7 +104,7 @@ test_connect_to_invalid_host(Config) ->
     ok.
 
 test_connect_to_invalid_port(_Config) ->
-    {error, timeout} = rdma:connect("localhost", 1000),
+    {error, rejected} = rdma:connect("localhost", 1000),
     ok.
 
 test_accept_ignore_failed_connection(Config) ->

@@ -64,7 +64,7 @@ connect(Host, PortNumber, Options, Timeout)->
             receive
                 {Socket, established} ->
                     {ok, Socket};
-                {Socket, error, Reason} ->
+                {Socket, {error, Reason}} ->
                     close(Socket),
                     {error, Reason}
             after Timeout ->
