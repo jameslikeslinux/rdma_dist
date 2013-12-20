@@ -282,10 +282,4 @@ timeout(Socket) ->
     end.
 
 filter_proplist(Proplist, Keylist) ->
-    filter_proplist(Proplist, Keylist, []).
-
-filter_proplist(Proplist, [Key|Keys], Acc) ->
-    filter_proplist(Proplist, Keys, Acc ++ proplists:lookup_all(Key, Proplist));
-
-filter_proplist(_Proplist, [], Acc) ->
-    Acc.
+    lists:flatten(lists:map(fun(Key) -> proplists:lookup_all(Key, Proplist) end, Keylist)).
