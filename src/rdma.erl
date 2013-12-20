@@ -17,17 +17,19 @@
 -module(rdma).
 -author("James Lee <jlee@thestaticvoid.com>").
 
--export([connect/2, connect/3, connect/4, listen/1, listen/2, accept/1, accept/2, peername/1, sockname/1, send/2, recv/1, recv/2, close/1, controlling_process/2, tick/1, getstat/1, setopts/2]).
+-export([connect/2, connect/3, connect/4, listen/1, listen/2, accept/1, accept/2, peername/1, sockname/1, send/2, recv/1, recv/2, close/1, controlling_process/2, tick/1, getstat/1, setopts/2, cancel/1]).
 
--define(DRV_CONNECT, $C).
--define(DRV_LISTEN, $L).
--define(DRV_ACCEPT, $A).
--define(DRV_PEERNAME, $P).
--define(DRV_SOCKNAME, $S).
--define(DRV_RECV, $R).
+-define(DRV_CONNECT,    $C).
+-define(DRV_LISTEN,     $L).
+-define(DRV_ACCEPT,     $A).
+-define(DRV_PEERNAME,   $P).
+-define(DRV_SOCKNAME,   $S).
+-define(DRV_RECV,       $R).
 -define(DRV_DISCONNECT, $D).
--define(DRV_STATS, $s).
--define(DRV_SETOPTS, $O).
+-define(DRV_GETSTAT,    $G).
+-define(DRV_SETOPTS,    $O).
+-define(DRV_CANCEL,     $c).
+-define(DRV_TIMEOUT,    $T).
 
 -define(check_server(), case whereis(rdma_server) of
     undefined ->
@@ -48,7 +50,7 @@ connect(Host, PortNumber, Options) ->
 
 connect(Host, PortNumber, Options, Timeout)->
     ?check_server(),
-    Socket = open_port({spawn, "rdma_drv"}, [{packet, 4}]),
+    Socket = open_port({spawn, "rdma_drv"}, proplists:compact(filter_proplist(Options, [packet, binary]))),
 
     HostStr = case inet:ntoa(Host) of
         {error, einval} ->
@@ -79,7 +81,7 @@ listen(PortNumber) ->
 
 listen(PortNumber, Options) ->
     ?check_server(),
-    Socket = open_port({spawn, "rdma_drv"}, [{packet, 4}]),
+    Socket = open_port({spawn, "rdma_drv"}, proplists:compact(filter_proplist(Options, [packet, binary]))),
     case control(Socket, ?DRV_LISTEN, term_to_binary([{port, PortNumber} | prepare_options_list(Options)])) of
         ok -> 
             {ok, Socket};
@@ -103,13 +105,13 @@ accept(Socket, Timeout) ->
                             close(ClientPort),
                             accept(Socket, Timeout)
                     after Timeout ->
-                        % XXX: Stop polling; reset state
+                        timeout(Socket),
                         {error, timeout}
                     end;
                 {Socket, {error, Reason}} ->
                     {error, Reason}
             after Timeout ->
-                % XXX: Stop polling; reset state
+                timeout(Socket),
                 {error, timeout}
             end;
         {error, Reason} ->
@@ -174,7 +176,7 @@ recv(Socket, Timeout) ->
                     close(Socket),
                     {error, Reason} 
             after Timeout ->
-                % XXX: Stop polling; reset state
+                timeout(Socket),
                 {error, timeout}
             end;
         {error, Reason} ->
@@ -216,7 +218,7 @@ tick(Socket) ->
     send(Socket, [], [force]).
 
 getstat(Socket) ->
-    case catch control(Socket, ?DRV_STATS, []) of
+    case catch control(Socket, ?DRV_GETSTAT, []) of
         {ok, R, S, Q} ->
             {ok, R, S, Q};
         {'EXIT', {badarg, _}} ->
@@ -233,7 +235,15 @@ setopts(Socket, Options) ->
             {error, closed}
     end.
 
-% XXX: Create a cancel operation.
+cancel(Socket) ->
+    case catch control(Socket, ?DRV_CANCEL, []) of
+        ok ->
+            ok;
+        {'EXIT', {badarg, _}} ->
+            {error, closed}
+    end.
+
+% XXX: Create a flush operation.
 
 
 %%
@@ -262,3 +272,20 @@ close_port(Socket) ->
             % Socket is already closed.
             ok
     end.
+
+timeout(Socket) ->
+    case catch control(Socket, ?DRV_TIMEOUT, []) of
+        ok ->
+            ok;
+        {'EXIT', {badarg, _}} ->
+            {error, closed}
+    end.
+
+filter_proplist(Proplist, Keylist) ->
+    filter_proplist(Proplist, Keylist, []).
+
+filter_proplist(Proplist, [Key|Keys], Acc) ->
+    filter_proplist(Proplist, Keys, Acc ++ proplists:lookup_all(Key, Proplist));
+
+filter_proplist(_Proplist, [], Acc) ->
+    Acc.

@@ -22,6 +22,7 @@
 void rdma_drv_options_init(RdmaDrvOptions *options) {
     options->binary = false;
     options->active = false;
+    options->packet = 0;
     options->backlog = 5;
     options->port = 0;
     options->buffer_size = 1024;
@@ -53,6 +54,13 @@ static bool rdma_drv_options_parse_tuple(RdmaDrvOptions *options, char *buf, int
                 int active = 0;
                 if (ei_decode_boolean(buf, index, &active) == 0) {
                     options->active = (bool) active;
+                } else {
+                    return false;
+                }
+            } else if (strcmp(atom, "packet") == 0) {
+                long packet = 0;
+                if (ei_decode_long(buf, index, &packet) == 0) {
+                    options->packet = (int) packet;
                 } else {
                     return false;
                 }

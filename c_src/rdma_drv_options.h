@@ -22,6 +22,7 @@
 typedef struct {
     bool binary;
     bool active;
+    int packet;
     int backlog;
     short port;
     char ip[INET6_ADDRSTRLEN];

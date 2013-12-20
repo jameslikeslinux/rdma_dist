@@ -1,8 +1,24 @@
-%%%----------------------------------------------------------------------
-%%% File    : rdma_server.erl
-%%% Purpose : Holder for the rdma_drv ddll driver.
-%%% Created : 15 Mar 2000 
-%%%----------------------------------------------------------------------
+%%%
+%%% rdma_server.erl
+%%% Copyright (C) 2013 James Lee
+%%%
+%%% The contents of this file are subject to the Erlang Public License,
+%%% Version 1.1, (the "License"); you may not use this file except in
+%%% compliance with the License. You should have received a copy of the
+%%% Erlang Public License along with this software. If not, it can be
+%%% retrieved online at http://www.erlang.org/.
+%%%
+%%% Software distributed under the License is distributed on an "AS IS"
+%%% basis, WITHOUT WARRANTY OF ANY KIND, either express or implied. See
+%%% the License for the specific language governing rights and limitations
+%%% under the License.
+%%%
+
+%%%
+%%% This code is basically 'uds_server.erl' from the Erlang/OTP
+%%% distrubtion which is Copyright (C) Ericsson AB 1997-2013 and used
+%%% under the terms of the Erlang Public License, Version 1.1.
+%%%
 
 -module(rdma_server).
 
