@@ -63,7 +63,7 @@ select(Node) ->
 %% node is accessible through.
 %% ------------------------------------------------------------
 listen(Name) ->
-    case rdma:listen(0) of
+    case rdma:listen(0, [{packet, 4}]) of
         {ok, Listener} ->
             {ok, Address = {_, Port}} = rdma:sockname(Listener),
             {ok, Host} = inet:gethostname(),
@@ -130,8 +130,7 @@ do_accept(Kernel, AcceptPid, Socket, MyNode, Allowed, SetupTime) ->
                 mf_tick = fun rdma:tick/1,
                 mf_getstat = fun rdma:getstat/1
             },
-            dist_util:handshake_other_started(HSData),
-            error_msg("ACCEPTED~n", [])
+            dist_util:handshake_other_started(HSData)
     end.
 
 get_remote_id(Socket, Node) ->
@@ -161,7 +160,7 @@ do_setup(Kernel, Node, Type, MyNode, LongOrShortNames, SetupTime) ->
             case erl_epmd:port_please(Name, Ip) of
                 {port, TcpPort, Version} ->
                     dist_util:reset_timer(Timer),
-                    case rdma:connect(Ip, TcpPort) of
+                    case rdma:connect(Ip, TcpPort, [{packet, 4}]) of
                         {ok, Socket} ->
                             HSData = #hs_data{
                                 kernel_pid = Kernel,
