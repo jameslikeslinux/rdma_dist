@@ -189,15 +189,15 @@ do_setup(Kernel, Node, Type, MyNode, LongOrShortNames, SetupTime) ->
                             },
                             dist_util:handshake_we_started(HSData);
                         _ ->
-                            error_msg("connect~n", []),
+                            ?trace("connect~n", []),
                             ?shutdown(Node)
                     end;
                 _->
-                    error_msg("port_please~n", []),
+                    ?trace("port_please~n", []),
                     ?shutdown(Node)
             end;
         _ ->
-            error_msg("getaddr~n", []),
+            ?trace("getaddr~n", []),
             ?shutdown(Node)
     end.
 

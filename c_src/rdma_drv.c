@@ -57,7 +57,6 @@ typedef struct rdma_drv_data {
     RdmaDrvAction action;
     RdmaDrvOptions options;
     ErlDrvPort port;
-    ErlDrvPDL pdl;
     ErlDrvTermData caller;
 
     /* rdma connection manager stuff */
@@ -85,7 +84,10 @@ typedef struct rdma_drv_data {
     unsigned long received;
     unsigned long buffered;
 
-    struct rdma_drv_data *listener;
+    /* linked list for holding accepted sockets */
+    struct rdma_drv_data *listener; /* (head) */
+    struct rdma_drv_data *next;
+    ErlDrvMutex *list_mutex;
 } RdmaDrvData;
 
 static void rdma_drv_send_error_atom(RdmaDrvData *data, char *str) {
@@ -137,58 +139,40 @@ static void rdma_drv_resume(RdmaDrvData *data) {
 }
 
 static bool rdma_drv_add_data(RdmaDrvData *data, RdmaDrvData *add) {
-    if (!data->pdl) {
-        /*
-         * A port data lock is required since we're going to be
-         * manipulating the listener's port driver queue from the
-         * accepted socket's port driver thread.
-         */
-        data->pdl = driver_pdl_create(data->port);
-        if (!data->pdl) {
+    if (!data->list_mutex) {
+        data->list_mutex = erl_drv_mutex_create("list_mutex");
+        if (!data->list_mutex) {
             return false;
         }
     }
 
-    driver_pdl_lock(data->pdl);
-    driver_enq(data->port, (char *) &add, sizeof(add));
-    driver_pdl_unlock(data->pdl);
+    erl_drv_mutex_lock(data->list_mutex);
+    add->next = data->next;
+    data->next = add;
+    erl_drv_mutex_unlock(data->list_mutex);
 
     return true;
 }
 
 static bool rdma_drv_remove_data(RdmaDrvData *data, RdmaDrvData *remove) {
+    RdmaDrvData *i;
     bool ret = false;
-    int i;
-    ErlIOVec queue;
-    ErlDrvSizeT queue_size;
-    RdmaDrvData *popped = NULL;
 
-    if (!data->pdl) {
+    if (!data->list_mutex) {
         return false;
     }
 
-    driver_pdl_lock(data->pdl);
+    erl_drv_mutex_lock(data->list_mutex);
 
-    /*
-     * Iterate over the queue, popping each "element", and checking
-     * if it matches what we're looking to remove.  If it doesn't match
-     * add it back into the queue.
-     */
-    queue_size = driver_peekqv(data->port, &queue);
-    for (i = 0; i < queue_size / sizeof(popped); i++) {
-        driver_vec_to_buf(&queue, (char *) &popped, sizeof(popped));
-        driver_deq(data->port, sizeof(popped));
-
-        if (popped == remove) {
+    for (i = data; i->next != NULL; i = i->next) {
+        if (i->next == remove) {
+            i->next = i->next->next;
             ret = true;
             break;
-        } else {
-            driver_enq(data->port, (char *) &popped, sizeof(popped));
-            driver_peekqv(data->port, &queue);
         }
     }
 
-    driver_pdl_unlock(data->pdl);
+    erl_drv_mutex_unlock(data->list_mutex);
 
     return ret;
 }
@@ -407,18 +391,22 @@ static ErlDrvData rdma_drv_start(ErlDrvPort port, char *command) {
 }
 
 static void rdma_drv_stop(ErlDrvData drv_data) {
-    RdmaDrvData *data = (RdmaDrvData *) drv_data;
+    RdmaDrvData *data = (RdmaDrvData *) drv_data, *i;
 
     /* Stop polling event channels. */
     rdma_drv_pause(data);
 
-    /* 
-     * If this is was an "accepted" socket, remove it from the
-     * listener's list of accepted sockets.  The listener will only
-     * close if its list of accepted sockets is empty.
-     */
-    if (data->listener) {
-        rdma_drv_remove_data(data->listener, data);
+    /* Kill child sockets. */
+    if (data->list_mutex) {
+        erl_drv_mutex_lock(data->list_mutex);
+        for (i = data; i->next != NULL; i = i->next) {
+            rdma_drv_send_error_atom(i->next, "closed");
+            driver_failure_eof(i->next->port); 
+        }
+        data->next = NULL;
+        erl_drv_mutex_unlock(data->list_mutex);
+        erl_drv_mutex_destroy(data->list_mutex);
+        data->list_mutex = NULL;
     }
 
     rdma_drv_free_ibverbs(data); 
@@ -542,13 +530,8 @@ static void rdma_drv_handle_rdma_cm_event_connect_request(RdmaDrvData *data, str
     set_port_control_flags(new_port, PORT_CONTROL_FLAG_BINARY);
 
     /*
-     * Connect the new port data to the listener.
-     *
-     * We add the new port data to the listener's driver queue as an
-     * indication to the emulator that the listener shouldn't be closed
-     * as long as there are accepted sockets still open.  Otherwise,
-     * when used as a distribution driver, the emulator attempts to
-     * close the listener port first, which seems to result in deadlock.
+     * Connect the new port data to the listener so it can be closed
+     * if the listener decides to first.
      */
     new_data->listener = data;
     ret = rdma_drv_add_data(data, new_data);
@@ -666,6 +649,9 @@ static void rdma_drv_handle_rdma_cm_event_disconnected(RdmaDrvData *data, struct
          * previously accepted socket.
          */
         data = (RdmaDrvData *) cm_event->id->context;
+
+        /* Unlink socket from the listener. */
+        rdma_drv_remove_data(data->listener, data);
     }
 
     if (data->action == ACTION_DISCONNECTING) {

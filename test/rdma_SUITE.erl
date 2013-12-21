@@ -29,6 +29,7 @@ all() -> [
     test_accept_ignore_failed_connection,
     test_close_client_socket,
     test_close_server_socket,
+    test_close_listener,
     test_close_with_buffered_data,
     test_send_before_recv,
     test_recv_before_send,
@@ -137,6 +138,20 @@ test_close_server_socket(Config) ->
     Key = rpc:async_call(node(), rdma, recv, [Client]),
     ok = rdma:close(Server),
     {error, closed} = rpc:yield(Key),
+    ok = rdma:close(Client),    % just to be sure
+    ok.
+
+test_close_listener(Config) ->
+    Listener = ?config(listener, Config),
+    start_accept(Listener),
+    {ok, Client} = rdma:connect("localhost", ?config(port_number, Config)),
+    {ok, Server} = accept(Listener),
+    KeyServer = rpc:async_call(node(), rdma, recv, [Server]),
+    KeyClient = rpc:async_call(node(), rdma, recv, [Client]),
+    ok = rdma:close(Listener),
+    {error, closed} = rpc:yield(KeyServer),
+    {error, closed} = rpc:yield(KeyClient),
+    ok = rdma:close(Server),    % just to be sure
     ok = rdma:close(Client),    % just to be sure
     ok.
 
