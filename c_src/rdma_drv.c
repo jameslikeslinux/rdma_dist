@@ -400,6 +400,7 @@ static void rdma_drv_stop(ErlDrvData drv_data) {
     if (data->list_mutex) {
         erl_drv_mutex_lock(data->list_mutex);
         for (i = data; i->next != NULL; i = i->next) {
+            i->next->listener = NULL;   /* the listener is closed */
             rdma_drv_send_error_atom(i->next, "closed");
             driver_failure_eof(i->next->port); 
         }
@@ -417,6 +418,14 @@ static void rdma_drv_stop(ErlDrvData drv_data) {
 
     if (data->ec) {
         rdma_destroy_event_channel(data->ec);
+    }
+
+    /*
+     * If this was an "accepted" socket, remove it from the listener's
+     * list of accepted sockets.
+     */
+    if (data->listener) {
+        rdma_drv_remove_data(data->listener, data);
     }
 
     driver_free(data);
@@ -649,9 +658,6 @@ static void rdma_drv_handle_rdma_cm_event_disconnected(RdmaDrvData *data, struct
          * previously accepted socket.
          */
         data = (RdmaDrvData *) cm_event->id->context;
-
-        /* Unlink socket from the listener. */
-        rdma_drv_remove_data(data->listener, data);
     }
 
     if (data->action == ACTION_DISCONNECTING) {
@@ -1033,7 +1039,6 @@ static void rdma_drv_control_listen(RdmaDrvData *data, char *buf, ei_x_buff *x) 
 }
 
 static void rdma_drv_control_accept(RdmaDrvData *data, ei_x_buff *x) {
-/*
     if (data->action == ACTION_ACCEPTING && driver_caller(data->port) != data->caller) {
         rdma_drv_encode_error_atom(x, "already_accepting");
         return;
@@ -1043,7 +1048,7 @@ static void rdma_drv_control_accept(RdmaDrvData *data, ei_x_buff *x) {
         rdma_drv_encode_error_atom(x, "not_listening");
         return;
     }
-*/
+
     data->action = ACTION_ACCEPTING;
 
     /* Start polling. */
