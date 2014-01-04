@@ -227,12 +227,15 @@ static void rdma_drv_post_send(RdmaDrvData *data, void *buffer, ErlDrvSizeT rema
     wr.opcode = IBV_WR_SEND_WITH_IMM;
     wr.send_flags = IBV_SEND_SIGNALED;
     wr.imm_data = htonl(remaining);
-    wr.sg_list = &sge;
-    wr.num_sge = 1;
 
-    sge.addr = (uintptr_t) buffer;
-    sge.length = remaining < data->options.buffer_size ? remaining : data->options.buffer_size;
-    sge.lkey = data->send_mr->lkey;
+    if (remaining) {
+        wr.sg_list = &sge;
+        wr.num_sge = 1;
+
+        sge.addr = (uintptr_t) buffer;
+        sge.length = remaining < data->options.buffer_size ? remaining : data->options.buffer_size;
+        sge.lkey = data->send_mr->lkey;
+    }
 
     ret = ibv_post_send(data->id->qp, &wr, &bad_wr);
     if (ret) {
